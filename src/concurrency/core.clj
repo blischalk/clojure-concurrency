@@ -1,5 +1,6 @@
 (ns concurrency.core)
 
+
 ; FUTURES: Place a task on another thread
 ; It is only run once and its result is cached
 
@@ -183,7 +184,12 @@
 
 
 ; QUEUEING
-
+; Sometimes the best way to handle concurrent tasks is to re-serialize them.
+; You can do that by placing your tasks onto a queue. In this example, you'll
+; make API calls to pull random quotes from I Heart Quotes and write them to
+; your own quote library. For this process, you want to allow the API calls
+; to happen concurrently but you want to serialize the writes so that none of
+; the quotes get garbled
 
 (defn append-to-file
   [filename s]
@@ -198,10 +204,140 @@
   (dotimes [_ n]
     (->> (slurp "http://www.iheartquotes.com/api/v1/random")
          format-quote
+         ; Because te file is shared across threads
+         ; there is the possibility of writes getting mixed up
          (append-to-file filename)
          (future))))
 
-(snag-quotes 2 "quotes.txt")
+(defn random-quote
+  []
+  (comment (format-quote (slurp "http://www.iheartquotes.com/api/v1/random")))
+  "foo bar")
+
+
+(defmacro enqueue
+  [q concurrent-promise-name & work]
+  ; Stuff that should be done concurrently (querying api for quote)
+  ; Stuff that should be serialized (writing quotes to file)
+  (let [concurrent (butlast work)
+        serialized (last work)]
+    ; Create a promise that will be fulfilled when concurrent
+    ; work has been completed
+    `(let [~concurrent-promise-name (promise)]
+       (future (deliver ~concurrent-promise-name (do ~@concurrent)))
+       ; Previous future / promise  in queue dereferenced here to block
+       ; Until it has completed its task
+       (deref ~q)
+       ; Writing to the file is dereferencing the concurrent promise
+       ; So the writing will block until that future has ben realized
+       ~serialized
+       ; Return the promise name so the next item in the queue
+       ; Can determine if we are finished doing our work
+       ~concurrent-promise-name)))
+
+
+(defmacro snag-quotes-queued
+  [n filename]
+  (let [quote-gensym (gensym)
+        queue `(enqueue ~quote-gensym
+                        (random-quote)
+                        (append-to-file ~filename @~quote-gensym))]
+    `(-> (future)
+         ~@(take n (repeat queue)))))
+
+(snag-quotes-queued 4 "quotes.txt")
+
+; => expands to:
+(-> (future)
+    (enqueue G__627 (random-quote) (append-to-file "quotes.txt" @G__627))
+    (enqueue G__627 (random-quote) (append-to-file "quotes.txt" @G__627))
+    (enqueue G__627 (random-quote) (append-to-file "quotes.txt" @G__627))
+    (enqueue G__627 (random-quote) (append-to-file "quotes.txt" @G__627)))
+
+
+(defmacro wait
+  "Sleep `timeout` seconds before evaluating body"
+  [timeout & body]
+  `(do (Thread/sleep ~timeout) ~@body))
+
+(snag-quotes-queued 4 "quotes.txt")
+
+; => expands to:
+(-> (future)
+    (enqueue G__627 (random-quote) (append-to-file "quotes.txt" @G__627))
+    (enqueue G__627 (random-quote) (append-to-file "quotes.txt" @G__627))
+    (enqueue G__627 (random-quote) (append-to-file "quotes.txt" @G__627))
+    (enqueue G__627 (random-quote) (append-to-file "quotes.txt" @G__627)))
+
+
+(defmacro wait
+  "Sleep `timeout` seconds before evaluating body"
+  [timeout & body]
+  `(do (Thread/sleep ~timeout) ~@body))
+
+(println (future (wait 200 (println "'Ello, gov'na!"))))
+
+(println "hello")
+
+(do (future (wait 200 (println "'Ello, gov'na!")))
+    (future (wait 400 (println "Pip pip!")))
+    (future (wait 100 (println "Cheerio!"))))
+
+(time @(-> (future (wait 200 (println "'Ello, gov'na!")))
+           (enqueue saying (wait 400 "Pip pip!") (println @saying))
+           (enqueue saying (wait 100 "Cheerio!") (println @saying))))
+
+; Reference Type Properties
+;
+; Synchronous: Will block while updating
+;
+; Asynchronous: Updated in backround.  No blocking.
+;
+; Coordinated: Uses STM to create a transaction
+; that ensures multiple instances are updated in lock-step
+;
+; Un-Coordinated: Does not ensure any other
+; instances are updated in lock-step
+
+
+; REF
+; Coordinated Synchronous Updates
+
+; ATOM
+; Un-Coordinated Synchronous Updates
+
+; AGENT
+; Un-Coordinated Asynchronous Updates
+
+; VAR
+
+(def my-atom (atom :foo))
+
+
+(let [p1 (promise)]
+  (println "spawning threads...")
+  (println @my-atom)
+  (future
+    (Thread/sleep 3000)
+    (reset! my-atom :bar)
+    (deliver p1 @my-atom))
+  (println "blocking until promise fulfilled")
+  @p1
+  (println "promise fulfilled")
+  (println "After first update")
+  (println @my-atom)
+  (future
+    (Thread/sleep 3000)
+    (reset! my-atom :wizzle)
+    (println "val after second update")
+    (println @my-atom))
+  (println "second update requested but val is...")
+  (println @my-atom))
+
+
+(-> 1
+    (partial + 1)
+    println)
 
 ; Experementation
 (let [result (future (Thread/sleep 2000)
@@ -211,6 +347,49 @@
   (println "no result yet...")
   (println (+ @result 2))
   (println @result))
+
+; Create a file with 35000 records
+; Each record with an incrementing id
+; And a random value between 1 35000
+;
+; ex.
+; 1 5
+; 2 15
+; 3 2
+; 4 19
+; etc.
+
+(def data-seq
+  "Creates colums of data with an auto incrementing key
+   and a random dumber"
+  (partition 4 (interleave (iterate inc 1)
+                           (repeatedly #(identity \space))
+                           (repeatedly #(rand-int 20))
+                           (repeatedly #(identity \newline)))))
+
+
+(defn create-data-rows! [count]
+  (let [data (take count data-seq)]
+    (spit "sample-data.txt" (apply str (map #(apply str %) data)))))
+
+
+; Time the execution of the following two trials:
+
+; Read and Parse the data
+(def data (read-and-parse (slurp "sample-data.txt")))
+
+
+(defn read-and-parse [data]
+  (for [col (map #(clojure.string/split % #" ")
+                 (clojure.string/split data #"\n"))]
+    (map #(Integer. %) col)))
+
+
+
+; Search the file on one core for the top 5 largest record(s)
+(take 3 (sort-by last > data))
+
+; Search the file on multiple cores for the top 5 largest record(s)
 
 
 
